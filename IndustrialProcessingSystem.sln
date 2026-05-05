@@ -3,9 +3,9 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "IndustrialProcessingSystem.Core", "IndustrialProcessingSystem.Core\IndustrialProcessingSystem.Core.csproj", "{1E4BB8EA-76A7-48E5-9AF5-1CEAFCDDD693}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "IndustrialProcessingSystem.Core", "IndustrialProcessingSystem.Core\IndustrialProcessingSystem.Core.csproj", "{1E4BB8EA-76A7-48E5-9AF5-1CEAFCDDD693}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "IndustrialProcessingSystem.Tests", "IndustrialProcessingSystem.Tests\IndustrialProcessingSystem.Tests.csproj", "{47FA4248-6AFF-4A85-8188-C903F8DE67B1}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "IndustrialProcessingSystem.Tests", "IndustrialProcessingSystem.Tests\IndustrialProcessingSystem.Tests.csproj", "{47FA4248-6AFF-4A85-8188-C903F8DE67B1}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

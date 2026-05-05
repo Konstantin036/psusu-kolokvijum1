@@ -6,7 +6,7 @@ namespace IndustrialProcessingSystem.Core.Models
     {
         public Guid Id { get; set; } = Guid.NewGuid();
         public JobType Type { get; set; }
-        public string Payload { get; set; }
+        public string Payload { get; set; } = string.Empty;
         public int Priority { get; set; }
     }
 }

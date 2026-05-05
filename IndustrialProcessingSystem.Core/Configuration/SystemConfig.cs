@@ -36,7 +36,7 @@ namespace IndustrialProcessingSystem.Core.Configuration
                         if (Enum.TryParse<Models.JobType>(typeStr, out var jobType))
                             job.Type = jobType;
 
-                        job.Payload = jobNode.Attribute("Payload")?.Value;
+                        job.Payload = jobNode.Attribute("Payload")?.Value ?? string.Empty;
 
                         if (int.TryParse(jobNode.Attribute("Priority")?.Value, out int priority))
                             job.Priority = priority;

@@ -2,44 +2,33 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
+using IndustrialProcessingSystem.Core.Infrastructure;
 using IndustrialProcessingSystem.Core.Models;
+using IndustrialProcessingSystem.Core.Reporting;
+using IndustrialProcessingSystem.Core.Services;
 
 namespace IndustrialProcessingSystem.Core.Processing
 {
-    public class JobEventsArgs : EventArgs
-    {
-        public required Job Job { get; set; }
-        public int Result { get; set; }
-        public Exception? Exception { get; set; }
-    }
-
     public class ProcessingSystem : IDisposable
     {
-        private readonly int _maxQueueSize;
         private readonly ConcurrentPriorityQueue<int, Job> _queue;
-
-        // idempotency + handle access
+        private readonly SemaphoreSlim _queueSpace;
         private readonly ConcurrentDictionary<Guid, Job> _jobHistory;
         private readonly ConcurrentDictionary<Guid, TaskCompletionSource<int>> _jobCompletions;
-
         private readonly CancellationTokenSource _cts;
         private readonly List<Task> _workers;
-
         private readonly IJobProcessor _processor;
         private readonly IEventLogger _eventLogger;
         private readonly IReportWriter _reportWriter;
         private readonly PeriodicTimer? _reportTimer;
-        
-        // Eventi
+
         public event EventHandler<JobEventsArgs>? JobCompleted;
         public event EventHandler<JobEventsArgs>? JobFailed;
 
-        // Metrika za izvestaj
         public ConcurrentBag<JobInfo> ExecutedJobs { get; } = new();
 
         public ProcessingSystem(int workerCount, int maxQueueSize)
@@ -53,7 +42,6 @@ namespace IndustrialProcessingSystem.Core.Processing
         {
         }
 
-        // dodatni ctor za testove (brže i deterministi?nije)
         internal ProcessingSystem(
             int workerCount,
             int maxQueueSize,
@@ -62,22 +50,19 @@ namespace IndustrialProcessingSystem.Core.Processing
             IReportWriter reportWriter,
             bool startReportLoop)
         {
-            if (maxQueueSize <= 0) throw new ArgumentOutOfRangeException(nameof(maxQueueSize));
             if (workerCount < 0) throw new ArgumentOutOfRangeException(nameof(workerCount));
+            if (maxQueueSize <= 0) throw new ArgumentOutOfRangeException(nameof(maxQueueSize));
 
-            _maxQueueSize = maxQueueSize;
             _queue = new ConcurrentPriorityQueue<int, Job>();
+            _queueSpace = new SemaphoreSlim(maxQueueSize, maxQueueSize);
             _jobHistory = new ConcurrentDictionary<Guid, Job>();
             _jobCompletions = new ConcurrentDictionary<Guid, TaskCompletionSource<int>>();
-
+            _cts = new CancellationTokenSource();
+            _workers = new List<Task>(workerCount);
             _processor = processor;
             _eventLogger = eventLogger;
             _reportWriter = reportWriter;
 
-            _cts = new CancellationTokenSource();
-            _workers = new List<Task>(workerCount);
-
-            // lambda subscriptions (zahtev)
             JobCompleted += (sender, args) => _ = _eventLogger.LogAsync(DateTime.Now, "Completed", args.Job.Id, args.Result);
             JobFailed += (sender, args) => _ = _eventLogger.LogAsync(DateTime.Now, "Failed", args.Job.Id, args.Result);
 
@@ -95,13 +80,13 @@ namespace IndustrialProcessingSystem.Core.Processing
         {
             if (job == null) throw new ArgumentNullException(nameof(job));
 
-            // idempotency: isti Job.Id samo jednom
+            // Idempotentnost: isti posao se prihvata samo jednom, bez obzira na broj niti.
             if (!_jobHistory.TryAdd(job.Id, job))
                 throw new InvalidOperationException("Idempotency violation");
 
-            if (_queue.Count >= _maxQueueSize)
+            // Semaphore cuva ukupan broj aktivnih poslova: i one u redu i one koji se trenutno rade.
+            if (!_queueSpace.Wait(0))
             {
-                // ako ne može u red, vrati stanje kao da nije ni prihva?en
                 _jobHistory.TryRemove(job.Id, out _);
                 throw new InvalidOperationException("Queue is full");
             }
@@ -110,6 +95,7 @@ namespace IndustrialProcessingSystem.Core.Processing
             if (!_jobCompletions.TryAdd(job.Id, tcs))
             {
                 _jobHistory.TryRemove(job.Id, out _);
+                _queueSpace.Release();
                 throw new InvalidOperationException("Idempotency violation");
             }
 
@@ -121,7 +107,8 @@ namespace IndustrialProcessingSystem.Core.Processing
         public IEnumerable<Job> GetTopJobs(int n)
         {
             if (n < 0) throw new ArgumentOutOfRangeException(nameof(n));
-            return _queue.GetUnorderedItems()
+
+            return _queue.GetItems()
                 .OrderBy(x => x.Priority)
                 .Select(x => x.Element)
                 .Take(n)
@@ -136,62 +123,78 @@ namespace IndustrialProcessingSystem.Core.Processing
 
         private async Task WorkerLoop(CancellationToken token)
         {
-            while (!token.IsCancellationRequested)
+            try
             {
-                if (_queue.TryDequeue(out var job))
+                while (!token.IsCancellationRequested)
                 {
-                    await ProcessJobWithRetry(job, token).ConfigureAwait(false);
+                    // Worker stalno pokusava da uzme najprioritetniji posao iz reda.
+                    if (_queue.TryDequeue(out var job))
+                    {
+                        await ProcessJobWithRetry(job, token).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await Task.Delay(20, token).ConfigureAwait(false);
+                    }
                 }
-                else
-                {
-                    await Task.Delay(20, token).ConfigureAwait(false);
-                }
+            }
+            catch (OperationCanceledException)
+            {
             }
         }
 
         private async Task ProcessJobWithRetry(Job job, CancellationToken token)
         {
-            const int maxRetries = 2; // + original = 3 total
+            const int maxRetries = 2;
 
-            for (int attempt = 0; attempt <= maxRetries; attempt++)
+            try
             {
-                var sw = Stopwatch.StartNew();
-                try
+                for (int attempt = 0; attempt <= maxRetries; attempt++)
                 {
-                    var execTask = _processor.ProcessAsync(job, token);
-                    var completed = await Task.WhenAny(execTask, Task.Delay(TimeSpan.FromSeconds(2), token)).ConfigureAwait(false);
+                    var sw = Stopwatch.StartNew();
 
-                    if (completed != execTask)
-                        throw new TimeoutException("Job took more than 2 seconds.");
-
-                    var result = await execTask.ConfigureAwait(false);
-                    sw.Stop();
-
-                    if (_jobCompletions.TryGetValue(job.Id, out var tcs))
-                        tcs.TrySetResult(result);
-
-                    ExecutedJobs.Add(new JobInfo { Type = job.Type, Success = true, Duration = sw.Elapsed.TotalMilliseconds });
-                    JobCompleted?.Invoke(this, new JobEventsArgs { Job = job, Result = result });
-                    return;
-                }
-                catch (Exception ex) when (!token.IsCancellationRequested)
-                {
-                    sw.Stop();
-
-                    if (attempt >= maxRetries)
+                    try
                     {
-                        ExecutedJobs.Add(new JobInfo { Type = job.Type, Success = false, Duration = sw.Elapsed.TotalMilliseconds });
+                        var execTask = _processor.ProcessAsync(job, token);
+                        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(2), token);
+                        var completed = await Task.WhenAny(execTask, timeoutTask).ConfigureAwait(false);
 
-                        // ABORT log (zahtev: ako i tre?i put failuje)
+                        // Posao se smatra neuspesnim ako ne zavrsi u roku od 2 sekunde.
+                        if (completed != execTask)
+                            throw new TimeoutException("Job took more than 2 seconds.");
+
+                        var result = await execTask.ConfigureAwait(false);
+                        sw.Stop();
+
+                        if (_jobCompletions.TryGetValue(job.Id, out var tcs))
+                            tcs.TrySetResult(result);
+
+                        ExecutedJobs.Add(new JobInfo(job.Type, success: true, sw.Elapsed.TotalMilliseconds));
+                        JobCompleted?.Invoke(this, new JobEventsArgs(job, result));
+                        return;
+                    }
+                    catch (Exception ex) when (!token.IsCancellationRequested)
+                    {
+                        sw.Stop();
+
+                        // Ukupno postoje 3 pokusaja: originalni pokusaj + 2 retry pokusaja.
+                        if (attempt < maxRetries)
+                            continue;
+
+                        ExecutedJobs.Add(new JobInfo(job.Type, success: false, sw.Elapsed.TotalMilliseconds));
                         await _eventLogger.LogAsync(DateTime.Now, "ABORT", job.Id, 0).ConfigureAwait(false);
 
                         if (_jobCompletions.TryGetValue(job.Id, out var tcs))
-                            tcs.TrySetCanceled(); // rezultat se ignoriše
+                            tcs.TrySetCanceled(token);
 
-                        JobFailed?.Invoke(this, new JobEventsArgs { Job = job, Result = 0, Exception = ex });
-                        return;
+                        JobFailed?.Invoke(this, new JobEventsArgs(job, 0, ex));
                     }
                 }
+            }
+            finally
+            {
+                // Kapacitet se oslobadja tek kada je posao stvarno gotov.
+                _queueSpace.Release();
             }
         }
 
@@ -202,18 +205,16 @@ namespace IndustrialProcessingSystem.Core.Processing
             try
             {
                 while (await _reportTimer.WaitForNextTickAsync(_cts.Token).ConfigureAwait(false))
-                {
                     GenerateReport();
-                }
             }
             catch (OperationCanceledException)
             {
-                // shutdown
             }
         }
 
         private void GenerateReport()
         {
+            // Snapshot pravi stabilnu sliku trenutne metrike dok worker niti nastavljaju da rade.
             var snapshot = ExecutedJobs.ToList();
 
             var successfulByType = snapshot
@@ -223,9 +224,8 @@ namespace IndustrialProcessingSystem.Core.Processing
                 {
                     Type = g.Key,
                     Count = g.Count(),
-                    AvgDuration = g.Average(x => x.Duration)
-                })
-                .ToList();
+                    AvgDuration = g.Average(x => x.DurationMs)
+                });
 
             var failedByType = snapshot
                 .Where(x => !x.Success)
@@ -235,25 +235,23 @@ namespace IndustrialProcessingSystem.Core.Processing
                     Type = g.Key,
                     Count = g.Count()
                 })
-                .OrderBy(x => x.Type)
-                .ToList();
+                .OrderBy(x => x.Type);
 
-            XElement root = new XElement("Report",
-                new XElement("GeneratedAt", DateTime.Now));
+            var root = new XElement("Report", new XElement("GeneratedAt", DateTime.Now));
 
-            foreach (var s in successfulByType)
+            foreach (var item in successfulByType)
             {
                 root.Add(new XElement("Success",
-                    new XAttribute("Type", s.Type),
-                    new XAttribute("Count", s.Count),
-                    new XAttribute("AvgTimeMs", s.AvgDuration)));
+                    new XAttribute("Type", item.Type),
+                    new XAttribute("Count", item.Count),
+                    new XAttribute("AvgTimeMs", item.AvgDuration)));
             }
 
-            foreach (var f in failedByType)
+            foreach (var item in failedByType)
             {
                 root.Add(new XElement("Failure",
-                    new XAttribute("Type", f.Type),
-                    new XAttribute("Count", f.Count)));
+                    new XAttribute("Type", item.Type),
+                    new XAttribute("Count", item.Count)));
             }
 
             _reportWriter.Write(root);
@@ -269,199 +267,11 @@ namespace IndustrialProcessingSystem.Core.Processing
             }
             catch
             {
-                // ignore shutdown issues
             }
 
             _reportTimer?.Dispose();
+            _queueSpace.Dispose();
             _cts.Dispose();
-        }
-    }
-
-    public class JobInfo
-    {
-        public JobType Type { get; set; }
-        public bool Success { get; set; }
-        public double Duration { get; set; }
-    }
-
-    internal interface IJobProcessor
-    {
-        Task<int> ProcessAsync(Job job, CancellationToken token);
-    }
-
-    internal sealed class JobProcessor : IJobProcessor
-    {
-        private static readonly ThreadLocal<Random> _rng = new(() => new Random());
-
-        public Task<int> ProcessAsync(Job job, CancellationToken token)
-        {
-            return Task.Run(() =>
-            {
-                token.ThrowIfCancellationRequested();
-
-                return job.Type switch
-                {
-                    JobType.Prime => ProcessPrime(job.Payload),
-                    JobType.IO => ProcessIo(job.Payload),
-                    _ => 0
-                };
-            }, token);
-        }
-
-        private static int ProcessPrime(string payload)
-        {
-            // payload: numbers:10000,threads:3
-            var parts = payload.Split(',');
-            int limit = int.Parse(parts[0].Split(':')[1]);
-            int threadsRaw = int.Parse(parts[1].Split(':')[1]);
-            int threads = Math.Clamp(threadsRaw, 1, 8);
-
-            return CalculatePrimesCount(limit, threads);
-        }
-
-        private static int ProcessIo(string payload)
-        {
-            // payload: delay:1000
-            var parts = payload.Split(':');
-            int delayMs = int.Parse(parts[1]);
-            Thread.Sleep(delayMs);
-            return _rng.Value!.Next(0, 101);
-        }
-
-        private static int CalculatePrimesCount(int limit, int threads)
-        {
-            int count = 0;
-            Parallel.For(2, limit, new ParallelOptions { MaxDegreeOfParallelism = threads }, i =>
-            {
-                bool isPrime = true;
-                int boundary = (int)Math.Sqrt(i);
-                for (int j = 2; j <= boundary; j++)
-                {
-                    if (i % j == 0)
-                    {
-                        isPrime = false;
-                        break;
-                    }
-                }
-
-                if (isPrime)
-                    Interlocked.Increment(ref count);
-            });
-            return count;
-        }
-    }
-
-    internal interface IEventLogger
-    {
-        Task LogAsync(DateTime timestamp, string status, Guid jobId, int result);
-    }
-
-    internal sealed class FileEventLogger : IEventLogger
-    {
-        private readonly string _path;
-        private readonly SemaphoreSlim _gate = new(1, 1);
-
-        public FileEventLogger(string path)
-        {
-            _path = path;
-        }
-
-        public async Task LogAsync(DateTime timestamp, string status, Guid jobId, int result)
-        {
-            string line = $"[{timestamp:O}] [{status}] {jobId}, {result}{Environment.NewLine}";
-
-            await _gate.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                await File.AppendAllTextAsync(_path, line).ConfigureAwait(false);
-            }
-            finally
-            {
-                _gate.Release();
-            }
-        }
-    }
-
-    internal interface IReportWriter
-    {
-        void Write(XElement report);
-    }
-
-    internal sealed class RollingXmlReportWriter : IReportWriter
-    {
-        private readonly string _directory;
-        private readonly int _maxFilesToKeep;
-
-        public RollingXmlReportWriter(string directory, int maxFilesToKeep)
-        {
-            _directory = directory;
-            _maxFilesToKeep = maxFilesToKeep;
-        }
-
-        public void Write(XElement report)
-        {
-            Directory.CreateDirectory(_directory);
-
-            string reportName = Path.Combine(_directory, $"Report_{DateTime.Now:yyyyMMdd_HHmmss}.xml");
-            report.Save(reportName);
-
-            var reports = Directory.GetFiles(_directory, "Report_*.xml")
-                .OrderBy(x => x)
-                .ToList();
-
-            while (reports.Count > _maxFilesToKeep)
-            {
-                File.Delete(reports[0]);
-                reports.RemoveAt(0);
-            }
-        }
-    }
-
-    public class ConcurrentPriorityQueue<TPriority, TElement> where TPriority : IComparable<TPriority>
-    {
-        private readonly List<(TPriority Priority, TElement Element)> _elements = new();
-        private readonly object _sync = new();
-
-        public int Count
-        {
-            get
-            {
-                lock (_sync)
-                    return _elements.Count;
-            }
-        }
-
-        public void Enqueue(TPriority priority, TElement item)
-        {
-            lock (_sync)
-            {
-                _elements.Add((priority, item));
-                _elements.Sort((x, y) => x.Priority.CompareTo(y.Priority));
-            }
-        }
-
-        public bool TryDequeue(out TElement item)
-        {
-            lock (_sync)
-            {
-                if (_elements.Count == 0)
-                {
-                    item = default!;
-                    return false;
-                }
-
-                item = _elements[0].Element;
-                _elements.RemoveAt(0);
-                return true;
-            }
-        }
-
-        public IEnumerable<(TPriority Priority, TElement Element)> GetUnorderedItems()
-        {
-            lock (_sync)
-            {
-                return _elements.ToList();
-            }
         }
     }
 }

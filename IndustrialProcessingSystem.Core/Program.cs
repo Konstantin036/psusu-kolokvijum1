@@ -44,15 +44,17 @@ namespace IndustrialProcessingSystem.Core
             // U tekstu: "procitati broj niti iz konfiguracionog fajla", "pokrenuti odgovarajuci broj niti koje nasumicno dodaju nove poslove"
             // Znaci broj niti za dadavanje poslova takodje zavisi od worker count
             CancellationTokenSource cts = new CancellationTokenSource();
+            var producerTasks = new List<Task>();
             for (int i = 0; i < workerCount; i++)
             {
-                Task.Run(() => ProduceJobsRandomly(system, cts.Token));
+                producerTasks.Add(Task.Run(() => ProduceJobsRandomly(system, cts.Token)));
             }
 
             Console.WriteLine("System is running. Press ENTER to simulate system shutdown...");
             Console.ReadLine();
 
             cts.Cancel();
+            await Task.WhenAll(producerTasks);
             Console.WriteLine("Shutting down the processing system...");
         }
 

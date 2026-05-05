@@ -83,6 +83,60 @@ namespace IndustrialProcessingSystem.Tests
         }
 
         [Fact]
+        public async Task JobExecution_PrimePayloadWithUnderscore_Success()
+        {
+            using var system = new ProcessingSystem(workerCount: 1, maxQueueSize: 10);
+            var job = new Job { Payload = "numbers:1_0,threads:20", Type = JobType.Prime };
+            var handle = system.Submit(job);
+
+            var completed = await Task.WhenAny(handle.Result, Task.Delay(TimeSpan.FromSeconds(2)));
+            Assert.Same(handle.Result, completed);
+
+            Assert.Equal(4, await handle.Result);
+        }
+
+        [Fact]
+        public void GetTopJobs_ReturnsJobsOrderedByPriority()
+        {
+            using var system = new ProcessingSystem(workerCount: 0, maxQueueSize: 10);
+            var lowPriority = new Job { Payload = "delay:10", Type = JobType.IO, Priority = 5 };
+            var highPriority = new Job { Payload = "delay:10", Type = JobType.IO, Priority = 1 };
+            var mediumPriority = new Job { Payload = "delay:10", Type = JobType.IO, Priority = 3 };
+
+            system.Submit(lowPriority);
+            system.Submit(highPriority);
+            system.Submit(mediumPriority);
+
+            var topJobs = system.GetTopJobs(2).ToList();
+
+            Assert.Equal([highPriority.Id, mediumPriority.Id], topJobs.Select(job => job.Id));
+        }
+
+        [Fact]
+        public async Task SubmitJob_ActiveJobCountsAgainstCapacity()
+        {
+            using var system = new ProcessingSystem(workerCount: 1, maxQueueSize: 1);
+            var runningJob = new Job { Payload = "delay:200", Type = JobType.IO };
+            system.Submit(runningJob);
+
+            await Task.Delay(50);
+
+            var secondJob = new Job { Payload = "delay:10", Type = JobType.IO };
+            Assert.Throws<InvalidOperationException>(() => system.Submit(secondJob));
+        }
+
+        [Fact]
+        public void SystemConfig_LoadValidFile_ParsesInitialJobs()
+        {
+            string configPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "SystemConfig.xml"));
+            var config = SystemConfig.Load(configPath);
+
+            Assert.Equal(5, config.WorkerCount);
+            Assert.Equal(100, config.MaxQueueSize);
+            Assert.Contains(config.Jobs, job => job.Type == JobType.Prime && job.Payload == "numbers:10_000,threads:3");
+        }
+
+        [Fact]
         public async Task JobExecution_Timeout_FailsAndRaisesEvent()
         {
             using var system = new ProcessingSystem(workerCount: 1, maxQueueSize: 10);
