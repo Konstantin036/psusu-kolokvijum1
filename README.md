@@ -202,6 +202,23 @@ Trenutno stanje:
 - testovi: `11/11` prolaze
 - line coverage: `69.81%`
 
+## Coverage dashboard
+
+GitHub Actions automatski generise i HTML coverage dashboard pomocu
+ReportGenerator-a.
+
+Kako se gleda:
+
+1. Otvori GitHub repo.
+2. Udji u tab `Actions`.
+3. Otvori poslednji `CI` run.
+4. Na dnu stranice, u sekciji `Artifacts`, preuzmi `coverage-report-html`.
+5. Raspakuj ZIP fajl.
+6. Otvori `index.html` u browseru.
+
+Na istoj stranici se vidi i kratak coverage summary, a HTML dashboard daje
+detaljniji prikaz po klasama, fajlovima i linijama koda.
+
 ## CI
 
 GitHub Actions workflow se nalazi u:
@@ -212,4 +229,3 @@ GitHub Actions workflow se nalazi u:
 
 Workflow na svaki push ili pull request pokrece restore, build, testove i code
 coverage. Rezultati testova i coverage fajl se cuvaju kao artifacts.
-
