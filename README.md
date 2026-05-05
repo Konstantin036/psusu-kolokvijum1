@@ -1,56 +1,150 @@
 # Industrial Processing System
 
-Ovo je mali producer-consumer sistem za obradu industrijskih poslova.
-Ideja je jednostavna: poslovi ulaze u sistem, cekaju u redu po prioritetu,
-worker niti ih uzimaju i obradjuju asinhrono.
+Industrial Processing System je jednostavan .NET sistem za asinhronu obradu
+poslova sa prioritetima. Projekat prikazuje kako vise niti moze bezbedno da
+prima, cuva i obradjuje poslove, uz logovanje dogadjaja, retry mehanizam,
+konfiguraciju preko XML fajla i automatsko generisanje izvestaja.
 
-## Sta sistem radi
+Najkraca ideja: posao udje u sistem, smesti se u prioritetni red, worker nit ga
+preuzme, obradi i upise rezultat.
 
-- `Submit(Job job)` prima posao i vraca `JobHandle`.
-- `JobHandle.Result` je `Task<int>` koji predstavlja buduci rezultat posla.
-- Manji broj u `Priority` znaci veci prioritet.
-- `MaxQueueSize` ogranicava broj aktivnih poslova u sistemu.
-- Isti `Job.Id` ne moze da se izvrsi vise puta.
-- `JobCompleted` i `JobFailed` se loguju asinhrono u `events.log`.
-- Ako posao traje duze od 2 sekunde, pokusava se jos 2 puta.
-- Ako i treci pokusaj ne uspe, u log se dodaje `ABORT`.
-- Na svakih minut pravi se XML izvestaj sa poslednjih najvise 10 fajlova.
+## Glavne mogucnosti
+
+- asinhrona obrada poslova pomocu `Task`
+- thread-safe pristup iz vise niti
+- prioritetni red, gde manji broj znaci veci prioritet
+- ogranicenje maksimalnog broja aktivnih poslova preko `MaxQueueSize`
+- idempotentnost, tako da isti `Job.Id` ne moze da se izvrsi vise puta
+- dogadjaji `JobCompleted` i `JobFailed`
+- asinhrono logovanje dogadjaja u `events.log`
+- timeout od 2 sekunde po pokusaju
+- retry mehanizam sa ukupno 3 pokusaja
+- `ABORT` log ako posao ne uspe ni iz treceg pokusaja
+- XML izvestaj na svakih minut
+- cuvanje poslednjih 10 izvestaja
+- unit testovi i code coverage
+
+## Model posla
+
+Svaki posao je predstavljen klasom `Job`.
+
+```csharp
+public class Job
+{
+    public Guid Id { get; set; }
+    public JobType Type { get; set; }
+    public string Payload { get; set; }
+    public int Priority { get; set; }
+}
+```
+
+Kada se posao posalje u sistem, metoda `Submit` vraca `JobHandle`.
+
+```csharp
+public class JobHandle
+{
+    public Guid Id { get; set; }
+    public Task<int> Result { get; set; }
+}
+```
+
+`Task<int>` znaci da rezultat ne mora biti spreman odmah. Sistem nastavlja da
+radi, a rezultat se moze sacekati kada bude potreban.
 
 ## Vrste poslova
 
-`Prime` posao dobija payload u formatu:
+Sistem podrzava dve vrste poslova.
+
+`Prime` posao racuna koliko ima prostih brojeva do zadate vrednosti. Payload
+izgleda ovako:
 
 ```text
 numbers:10_000,threads:3
 ```
 
-Racuna koliko ima prostih brojeva do zadate granice. Broj niti se pri
-parsiranju ogranicava na interval `[1,8]`.
+`numbers` je gornja granica za proveru brojeva, a `threads` je broj niti koje se
+koriste za racunanje. Broj niti se automatski ogranicava na interval `[1,8]`.
 
-`IO` posao dobija payload u formatu:
+`IO` posao simulira cekanje, kao da se cita vrednost sa neke spoljne adrese ili
+uredjaja. Payload izgleda ovako:
 
 ```text
 delay:1_000
 ```
 
-Simulira cekanje pomocu `Thread.Sleep` i vraca nasumican broj od 0 do 100.
+`delay` je trajanje cekanja u milisekundama. Nakon cekanja posao vraca nasumican
+broj od 0 do 100.
 
-## Organizacija koda
+## Kako sistem radi
 
-- `Models` - osnovni modeli: `Job`, `JobHandle`, `JobType`.
-- `Configuration` - citanje `SystemConfig.xml`.
-- `Processing` - glavni `ProcessingSystem`, dogadjaji i metrika.
-- `Services` - konkretna obrada poslova i parsiranje payload-a.
-- `Infrastructure` - thread-safe prioritetni red.
-- `Reporting` - logovanje dogadjaja i XML izvestaji.
+`ProcessingSystem` je centralna klasa. Ona prima poslove, cuva ih u
+prioritetnom redu i pokrece worker niti koje obradjuju poslove.
 
-Najbitnije za odbranu: `ProcessingSystem` ne zna detalje kako se broje prosti
-brojevi niti kako se pise XML fajl. On samo organizuje posao. Kao sef smene:
-prima naloge, pazi na red, daje radnicima zadatke i zapisuje sta se desilo.
+Tok jednog posla je:
+
+1. Korisnik pozove `Submit(job)`.
+2. Sistem proveri da li je posao vec ranije prihvacen.
+3. Sistem proveri da li ima mesta u redu.
+4. Posao se ubacuje u prioritetni red.
+5. Worker nit uzima posao sa najvecim prioritetom.
+6. Posao se izvrsava.
+7. Ako uspe, pokrece se `JobCompleted`.
+8. Ako ne uspe ili traje predugo, sistem pokusava ponovo.
+9. Ako ne uspe ni posle treceg pokusaja, upisuje se `ABORT`.
+
+Ovakav pristup prati producer-consumer obrazac: jedne niti proizvode poslove, a
+druge niti ih trose i obradjuju.
+
+## Thread-safe delovi
+
+Posto vise niti moze istovremeno da pristupa sistemu, nekoliko delova je
+posebno zasticeno:
+
+- `ConcurrentDictionary` cuva istoriju poslova i sprecava duplo izvrsavanje.
+- `ConcurrentPriorityQueue` koristi `lock` da bi prioritetni red bio bezbedan.
+- `SemaphoreSlim` kontrolise maksimalan broj aktivnih poslova.
+- `ConcurrentBag` cuva metriku zavrsenih poslova za izvestaje.
+
+## Organizacija projekta
+
+```text
+IndustrialProcessingSystem.Core
+|-- Configuration
+|   `-- SystemConfig.cs
+|-- Infrastructure
+|   `-- ConcurrentPriorityQueue.cs
+|-- Models
+|   |-- Job.cs
+|   |-- JobHandle.cs
+|   `-- JobType.cs
+|-- Processing
+|   |-- ProcessingSystem.cs
+|   |-- JobEventsArgs.cs
+|   `-- JobInfo.cs
+|-- Reporting
+|   |-- FileEventLogger.cs
+|   |-- IEventLogger.cs
+|   |-- IReportWriter.cs
+|   `-- RollingXmlReportWriter.cs
+|-- Services
+|   |-- IJobProcessor.cs
+|   |-- JobProcessor.cs
+|   `-- PayloadParser.cs
+`-- Program.cs
+```
+
+Podela je namerno jednostavna:
+
+- `Models` sadrzi osnovne podatke.
+- `Configuration` cita XML konfiguraciju.
+- `Processing` organizuje tok poslova.
+- `Services` zna kako se konkretni poslovi izvrsavaju.
+- `Infrastructure` sadrzi pomocne thread-safe strukture.
+- `Reporting` zapisuje logove i XML izvestaje.
 
 ## Konfiguracija
 
-Sistem cita `SystemConfig.xml`.
+Sistem se podesava kroz `SystemConfig.xml`.
 
 ```xml
 <SystemConfig>
@@ -63,54 +157,59 @@ Sistem cita `SystemConfig.xml`.
 </SystemConfig>
 ```
 
-`WorkerCount` odredjuje koliko worker niti obradjuje poslove i koliko producer
-niti u `Program.cs` nasumicno dodaje nove poslove.
+`WorkerCount` odredjuje broj worker niti, a `MaxQueueSize` maksimalan broj
+aktivnih poslova u sistemu. Pocetni poslovi se ucitavaju iz `Jobs` sekcije.
 
 ## Pokretanje
+
+Za pokretanje aplikacije:
 
 ```powershell
 dotnet run --project IndustrialProcessingSystem.Core
 ```
 
-Program ucita konfiguraciju, ubaci pocetne poslove, pokrene producere i radi
-dok se ne pritisne ENTER.
+Program ucita konfiguraciju, doda pocetne poslove i pokrene niti koje nasumicno
+dodaju nove poslove. Aplikacija radi dok se ne pritisne ENTER.
 
-## Testovi i coverage
+## Testovi
+
+Za pokretanje testova:
 
 ```powershell
 dotnet test IndustrialProcessingSystem.sln --no-restore -m:1
 ```
 
-Coverage:
+Testovi pokrivaju:
+
+- uspesno dodavanje posla
+- odbijanje posla kada je red pun
+- idempotentnost
+- izvrsavanje `Prime` i `IO` poslova
+- prioritetni red
+- timeout i `JobFailed` dogadjaj
+- citanje XML konfiguracije
+
+## Code coverage
+
+Coverage se pokrece komandom:
 
 ```powershell
 dotnet test IndustrialProcessingSystem.sln --no-restore -m:1 --collect:"XPlat Code Coverage" --results-directory TestResults
 ```
 
-Trenutno izmereno:
+Trenutno stanje:
 
 - testovi: `11/11` prolaze
 - line coverage: `69.81%`
-- zahtev iz PDF-a: najmanje `67%`
 
-## Kako objasniti na odbrani
+## CI
 
-Zamisli jednu traku u fabrici. Poslovi stizu na traku, ali nisu svi jednako
-hitni. Zato red uvek drzi najhitnije poslove napred.
+GitHub Actions workflow se nalazi u:
 
-Worker nit je radnik koji uzima prvi posao sa trake. Ako posao uspe, javlja se
-dogadjaj `JobCompleted`. Ako traje previse dugo, sistem ga pokusava ponovo.
-Posle tri neuspeha posao se oznacava kao `ABORT`, jer ne zelimo da zaglavi ceo
-sistem.
+```text
+.github/workflows/ci.yml
+```
 
-`Task<int>` je obecanje da ce rezultat stici kasnije. Zato `Submit` ne ceka da
-se posao zavrsi; odmah vrati `JobHandle`, a korisnik moze kasnije da saceka
-`handle.Result`.
+Workflow na svaki push ili pull request pokrece restore, build, testove i code
+coverage. Rezultati testova i coverage fajl se cuvaju kao artifacts.
 
-Thread-safe deo je vazan zato sto vise niti istovremeno dodaje i uzima poslove.
-Zato koristimo zakljucavanje u prioritetnom redu, `ConcurrentDictionary` za
-istoriju poslova i `SemaphoreSlim` da red nikada ne predje dozvoljeni kapacitet.
-
-LINQ izvestaj radi kao fotografija sistema: uzme zavrsene poslove, grupise ih po
-tipu, izracuna broj uspesnih, prosecno vreme i broj neuspesnih, pa to upise u
-XML.
